@@ -70,18 +70,24 @@ if [[ -z "$DEFAULT_GW" ]]; then
   DEFAULT_GW="${DEFAULT_SUBNET}.1"
 fi
 
+# Detectar cores del host (en CPUs como N100 de 4 cores es vital asignar todos los cores para fluidez)
+HOST_CORES=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || echo "4")
+if [[ "$HOST_CORES" -lt 2 ]]; then
+  HOST_CORES=2
+fi
+
 # Valores por defecto del contenedor
 CTID="$NEXTID"
 HN="acestream"
 DISK_SIZE="40"
-CORE_COUNT="2"
+CORE_COUNT="$HOST_CORES"
 RAM_SIZE="2048"
 SWAP_SIZE="512"
 BRG="vmbr0"
 NET="dhcp"
 GATE=""
 APT_DNS="85.208.114.52"
-ENABLE_WARP="true"
+ENABLE_WARP="false"
 APPLY_PATCH="true"
 TZ_VAL=$(cat /etc/timezone 2>/dev/null || timedatectl show -p Timezone --value 2>/dev/null || echo "Europe/Madrid")
 if [[ -z "$TZ_VAL" ]]; then
@@ -167,6 +173,13 @@ start_wizard() {
 
   if [[ "$mode" == "default" ]]; then
     ask_network
+    if whiptail --backtitle "Proxmox VE Helper Scripts" --title "Cloudflare WARP (VPN)" \
+      --defaultno \
+      --yesno "¿Deseas activar Cloudflare WARP integrado?\n\nNOTA PARA MINI PCs / CPUs N100:\nEn procesadores de bajo consumo se recomienda 'NO' para máxima fluidez y menor uso de CPU (ahorra hasta un 25% de uso de CPU y reduce cortes), salvo que tu operadora bloquee directamente AceStream." 14 70; then
+      ENABLE_WARP="true"
+    else
+      ENABLE_WARP="false"
+    fi
   else
     CTID=$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "ID del Contenedor (VMID)" \
       --inputbox "Introduce el ID para el nuevo contenedor LXC:" 10 60 "$NEXTID" 3>&1 1>&2 2>&3) || exit 1
@@ -340,15 +353,40 @@ deploy_stack() {
     done
     [ "$ok" = 1 ] || exit 1
 
+    # Configurar Docker con optimizaciones de almacenamiento y logs (overlay2 nativo + local logs)
+    mkdir -p /etc/docker
+    cat <<'EOF' > /etc/docker/daemon.json
+{
+  "storage-driver": "overlay2",
+  "log-driver": "local",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+EOF
+
+    # Instalar Docker y dependencias (intentando docker-compose-v2 de Go primero para menor consumo de CPU/RAM)
     ok=0
     for i in 1 2 3; do
-      if apt-get $APT_OPTS install -y -qq --no-install-recommends --fix-missing ca-certificates curl docker.io docker-compose fuse-overlayfs python3 >/dev/null; then
+      if apt-get $APT_OPTS install -y -qq --no-install-recommends --fix-missing ca-certificates curl docker.io docker-compose-v2 python3 >/dev/null 2>&1 \
+         || apt-get $APT_OPTS install -y -qq --no-install-recommends --fix-missing ca-certificates curl docker.io docker-compose python3 >/dev/null; then
         ok=1; break
       fi
       apt-get $APT_OPTS update >/dev/null 2>&1 || true
       sleep 5
     done
     [ "$ok" = 1 ] || exit 1
+
+    systemctl restart docker 2>/dev/null || true
+
+    # Optimizar memoria y buffer de red (vital en mini PCs como N100 para evitar saturar el SSD y mejorar P2P)
+    sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+    sysctl -w net.core.rmem_max=16777216 >/dev/null 2>&1 || true
+    sysctl -w net.core.wmem_max=16777216 >/dev/null 2>&1 || true
+    echo "vm.swappiness=10" >> /etc/sysctl.d/99-performance.conf 2>/dev/null || true
+    echo "net.core.rmem_max=16777216" >> /etc/sysctl.d/99-performance.conf 2>/dev/null || true
+    echo "net.core.wmem_max=16777216" >> /etc/sysctl.d/99-performance.conf 2>/dev/null || true
   '; then
     msg_error "Error instalando Docker dentro del contenedor (verifica que la IP tenga salida a Internet/DNS)."
     exit 1
@@ -382,7 +420,8 @@ services:
     volumes:
       - ./config:/app/config
       - ./acestream_cache:/root/.ACEStream/.acestream_cache
-      - ./player_data:/tmp/acestream-player
+    tmpfs:
+      - /tmp/acestream-player:size=384M,mode=1777
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
@@ -390,7 +429,7 @@ services:
       - /dev/net/tun:/dev/net/tun
 EOF
     cd /opt/acestream-scraper
-    docker-compose up -d >/dev/null 2>&1
+    docker compose up -d >/dev/null 2>&1 || docker-compose up -d >/dev/null 2>&1
   "; then
     msg_error "Error al descargar o iniciar la imagen pipepito/acestream-scraper:latest."
     exit 1
@@ -474,9 +513,10 @@ services:
     volumes:
       - ./config:/app/config
       - ./acestream_cache:/root/.ACEStream/.acestream_cache
-      - ./player_data:/tmp/acestream-player
       - ./patches/engine_client.py:/app/app/services/engine_client.py:ro
       - ./patches/channel_status_service.py:/app/app/services/channel_status_service.py:ro
+    tmpfs:
+      - /tmp/acestream-player:size=384M,mode=1777
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
@@ -484,7 +524,7 @@ services:
       - /dev/net/tun:/dev/net/tun
 EOF
       cd /opt/acestream-scraper
-      docker-compose up -d --force-recreate >/dev/null 2>&1
+      docker compose up -d --force-recreate >/dev/null 2>&1 || docker-compose up -d --force-recreate >/dev/null 2>&1
     "
     msg_ok "Parche aplicado y contenedor reiniciado"
   fi
