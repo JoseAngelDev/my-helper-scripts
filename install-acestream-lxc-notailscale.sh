@@ -304,6 +304,18 @@ lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file
 EOF
   msg_ok "Dispositivo /dev/net/tun configurado en /etc/pve/lxc/${CTID}.conf"
 
+  # GPU Passthrough (/dev/dri) para aceleración por hardware Intel QuickSync
+  if [[ -d "/dev/dri" ]]; then
+    msg_info "Habilitando passthrough de GPU Intel /dev/dri (QuickSync/VAAPI)"
+    chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true
+    cat <<'EOF' >> "/etc/pve/lxc/${CTID}.conf"
+lxc.cgroup2.devices.allow: c 226:* rwm
+lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir
+lxc.hook.pre-start: sh -c "chmod 666 /dev/dri/card* /dev/dri/renderD* 2>/dev/null || true"
+EOF
+    msg_ok "Passthrough de GPU Intel /dev/dri configurado en /etc/pve/lxc/${CTID}.conf"
+  fi
+
   msg_info "Arrancando contenedor LXC ${CTID}"
   if ! pct start "$CTID"; then
     msg_error "No se pudo arrancar el contenedor LXC ${CTID}."
@@ -393,6 +405,11 @@ EOF
   fi
   msg_ok "Docker y dependencias instalados"
 
+  local gpu_compose=""
+  if pct exec "$CTID" -- test -d /dev/dri; then
+    gpu_compose="      - /dev/dri:/dev/dri"
+  fi
+
   msg_info "Descargando y levantando pipepito/acestream-scraper:latest (puede tardar 1-2 min)"
   if ! pct exec "$CTID" -- bash -c "
     mkdir -p /opt/acestream-scraper
@@ -427,6 +444,7 @@ services:
       - SYS_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+${gpu_compose}
 EOF
     cd /opt/acestream-scraper
     docker compose up -d >/dev/null 2>&1 || docker-compose up -d >/dev/null 2>&1
@@ -522,6 +540,7 @@ services:
       - SYS_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+${gpu_compose}
 EOF
       cd /opt/acestream-scraper
       docker compose up -d --force-recreate >/dev/null 2>&1 || docker-compose up -d --force-recreate >/dev/null 2>&1
